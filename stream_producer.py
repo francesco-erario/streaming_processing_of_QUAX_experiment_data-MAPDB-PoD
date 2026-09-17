@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import csv
 import io
 import json
 import logging
@@ -11,11 +13,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
+import numpy as np
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
-from botocore.config import Config as BotocoreConfig
 from dotenv import load_dotenv
 from kafka import KafkaProducer
+from kafka.errors import MessageSizeTooLargeError
 from bench import BenchmarkRecorder
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -59,6 +62,9 @@ def permanent_s3_error(exc: Exception) -> bool:
     return False
 
 
+def permanent_kafka_error(exc: Exception) -> bool:
+    return isinstance(exc, MessageSizeTooLargeError)
+
 def retry_with_backoff(func, *, max_retries: int, description: str, is_permanent=lambda e: False):
     attempt = 0
     while True:
@@ -85,7 +91,6 @@ def make_s3_client():
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         verify=False,
-        config=BotocoreConfig(max_pool_connections=64),
     )
 
 
@@ -108,17 +113,17 @@ def discover_pairs(s3_client) -> list[str]:
 transfer_config = TransferConfig(max_concurrency=16, use_threads=True)
 
 
-def download_component_once(s3_client, component: str, batch_id: str) -> bytes:
+def download_component_once(s3_client, component: str, batch_id: str) -> np.ndarray:
     key = f"duck_{component}_{batch_id}.dat"
     buf = io.BytesIO()
     s3_client.download_fileobj(S3_BUCKET, key, buf, Config = transfer_config)
     raw = buf.getvalue()
     if len(raw) != EXPECTED_BYTES:
         raise ValueError(f"{key}: expected {EXPECTED_BYTES} bytes, got {len(raw)}")
-    return raw
+    return np.frombuffer(raw, dtype="<f4").reshape(ROWS, COLS)
 
 
-def download_component(s3_client, component: str, batch_id: str, bench: BenchmarkRecorder, max_retries: int) -> bytes:
+def download_component(s3_client, component: str, batch_id: str, bench: BenchmarkRecorder, max_retries: int) -> np.ndarray:
     with bench.timed(batch_id, f"download_{component}"):
         return retry_with_backoff(
             lambda: download_component_once(s3_client, component, batch_id),
@@ -128,7 +133,7 @@ def download_component(s3_client, component: str, batch_id: str, bench: Benchmar
         )
 
 
-def download_pair(s3_client, batch_id: str, bench: BenchmarkRecorder, max_retries: int) -> tuple[bytes, bytes]:
+def download_pair(s3_client, batch_id: str, bench: BenchmarkRecorder, max_retries: int) -> tuple[np.ndarray, np.ndarray]:
     with bench.timed(batch_id, "download_total"):
         with ThreadPoolExecutor(max_workers=2) as pool:
             fut_i = pool.submit(download_component, s3_client, "i", batch_id, bench, max_retries)
@@ -144,44 +149,55 @@ def make_producer() -> KafkaProducer:
     return KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         max_request_size=100 * 1024 * 1024,
-        acks = "all"
+        enable_idempotence=False,
+        acks = 1
     )
 
-def build_message(batch_id: str, slice_idx: int, n_slices: int, slice_i: bytes, slice_q: bytes, batch_timestamp: float) -> bytes:
-    
-    n_bytes_slice = len(slice_i)   # uguale per slice_q per costruzione
+
+def build_message(batch_id: str, slice_idx: int, n_slices: int, slice_i: np.ndarray, slice_q: np.ndarray, batch_timestamp: float) -> bytes:
     header = {
-        "batch_id":   batch_id,
-        "slice_idx":  slice_idx,
-        "n_slices":   n_slices,
-        "n_bytes_i":  n_bytes_slice,
-        "n_bytes_q":  n_bytes_slice,
-        "dtype":      "float32-le",
-        "timestamp":  batch_timestamp,
+        "batch_id": batch_id,
+        "slice_idx": slice_idx,
+        "n_slices": n_slices,
+        "shape_i": list(slice_i.shape),
+        "shape_q": list(slice_q.shape),
+        "dtype": "float32",
+        "timestamp": batch_timestamp,
     }
     header_bytes = json.dumps(header).encode("utf-8")
-    payload = slice_i + slice_q   
+    payload = slice_i.tobytes() + slice_q.tobytes()
     return struct.pack(">I", len(header_bytes)) + header_bytes + payload
+
+
+def publish_once(producer: KafkaProducer, topic: str, key: bytes, value: bytes, timeout: int) -> None:
+    future = producer.send(topic, key=key, value=value)
+    future.get(timeout=timeout)
+
+
+def publish_and_confirm(producer: KafkaProducer, topic: str, key: bytes, value: bytes, max_retries: int, timeout: int = 30) -> None:
+    retry_with_backoff(
+        lambda: publish_once(producer, topic, key, value, timeout),
+        max_retries = max_retries,
+        description = f"publish (key={key!r})",
+        is_permanent = permanent_kafka_error,
+    )
 
 
 # Producer loop
 
 def process_batch(s3_client, producer: KafkaProducer, batch_id: str, bench: BenchmarkRecorder, n_slices: int, max_retries: int) -> None:
     with bench.timed(batch_id, "batch_total"):
-        raw_i, raw_q = download_pair(s3_client, batch_id, bench, max_retries)
         batch_timestamp = time.time()
-        
+        data_i, data_q = download_pair(s3_client, batch_id, bench, max_retries)
+
         with bench.timed(batch_id, "slicing"):
-            slice_size = EXPECTED_BYTES // n_slices
-            slices_i = [raw_i[k * slice_size:(k + 1) * slice_size] for k in range(n_slices)]
-            slices_q = [raw_q[k * slice_size:(k + 1) * slice_size] for k in range(n_slices)]
-            
+            slices_i = np.array_split(data_i, n_slices, axis=0)
+            slices_q = np.array_split(data_q, n_slices, axis=0)
 
         with bench.timed(batch_id, "publish"):
-            messages = [build_message(batch_id, idx, n_slices, si, sq, batch_timestamp) for idx, (si, sq) in enumerate(zip(slices_i, slices_q))]
-            futures = [producer.send(STREAM_TOPIC, key=batch_id.encode(), value=msg) for msg in messages]
-            for future in futures:
-                future.get(timeout=30)
+            for idx, (si, sq) in enumerate(zip(slices_i, slices_q)):
+                msg = build_message(batch_id, idx, n_slices, si, sq, batch_timestamp)
+                publish_and_confirm(producer, STREAM_TOPIC, key=batch_id.encode(), value=msg, max_retries=max_retries)
 
     log.info("batch %s published (%d slices)", batch_id, n_slices)
 
@@ -190,9 +206,6 @@ def run_producer(batch_ids: list[str], bench: BenchmarkRecorder, rate_seconds: f
 
     s3_client = make_s3_client()
     producer = make_producer()
-    num_partitions = len(producer.partitions_for(STREAM_TOPIC) or [])
-    if max_in_flight < num_partitions:
-        log.warning("max_in_flight=%d but topic %s has %d partitions: only %d of them can be fed at a time", max_in_flight, STREAM_TOPIC, num_partitions, max_in_flight)
     in_flight = threading.Semaphore(max_in_flight)
 
     def worker(batch_id: str):
